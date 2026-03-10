@@ -3,7 +3,7 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { WechatAccessWebSocketClient, handlePrompt, handleCancel } from "./websocket/index.js";
 // import { handleSimpleWecomWebhook } from "./http/webhook.js";
 import { setWecomRuntime, getWecomRuntime } from "./common/runtime.js";
-import { performLogin, loadState, clearState, saveState, getDeviceGuid, getEnvironment, QClawAPI, buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./auth/index.js";
+import { performLogin, loadState, clearState, saveState, getDeviceGuid, getEnvironment, QClawAPI, TokenExpiredError, buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./auth/index.js";
 import type { QClawEnvironment, PersistedAuthState } from "./auth/index.js";
 import { nested } from "./auth/utils.js";
 
@@ -338,20 +338,64 @@ const tencentAccessPlugin = {
       });
 
       // Token 获取策略：配置 > 已保存的登录态 > 提示用户手动登录
-      if (!token) {
-        const savedState = loadState(authStatePath);
-        if (savedState?.channelToken) {
-          token = savedState.channelToken;
-          log?.info(`[wechat-access] 使用已保存的 token: ${token.substring(0, 6)}...`);
-        } else {
-          log?.warn(`[wechat-access] 未找到 token，请运行 "openclaw channels login --channel wechat-access-unqclawed" 完成扫码登录，然后重启 Gateway`);
-          return;
-        }
+      const savedState = loadState(authStatePath);
+      if (!token && savedState?.channelToken) {
+        token = savedState.channelToken;
+        log?.info(`[wechat-access] 使用已保存的 token: ${token.substring(0, 6)}...`);
       }
 
       if (!token) {
-        log?.warn(`[wechat-access] token 为空，跳过 WebSocket 连接`);
+        log?.warn(`[wechat-access] 未找到 token，请运行 "openclaw channels login --channel wechat-access-unqclawed" 完成扫码登录，然后重启 Gateway`);
         return;
+      }
+
+      // Token 刷新：用 jwt_token 调 4058 获取最新 channel_token（QClaw 客户端每次打开都会刷新）
+      const jwtToken = savedState?.jwtToken || "";
+      if (jwtToken) {
+        const api = new QClawAPI(env, guid, jwtToken);
+        api.userId = String((savedState?.userInfo as Record<string, unknown>)?.user_id ?? "");
+        const savedLoginKey = (savedState?.userInfo as Record<string, unknown>)?.loginKey as string | undefined;
+        if (savedLoginKey) api.loginKey = savedLoginKey;
+
+        let refreshed = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const newToken = await api.refreshChannelToken();
+            if (newToken) {
+              token = newToken;
+              log?.info(`[wechat-access] channel_token 已刷新: ${token.substring(0, 6)}...`);
+              // 更新保存的状态和配置
+              if (savedState) {
+                savedState.channelToken = newToken;
+                savedState.savedAt = Date.now();
+                saveState(savedState, authStatePath);
+              }
+              try {
+                const wRuntime = getWecomRuntime();
+                const fullCfg = wRuntime.config.loadConfig();
+                const channels = { ...(fullCfg.channels ?? {}) } as Record<string, any>;
+                channels["wechat-access-unqclawed"] = {
+                  ...(channels["wechat-access-unqclawed"] ?? {}),
+                  token: newToken,
+                };
+                await wRuntime.config.writeConfigFile({ ...fullCfg, channels });
+              } catch { /* non-fatal */ }
+              refreshed = true;
+              break;
+            }
+          } catch (e) {
+            if (e instanceof TokenExpiredError) {
+              clearState(authStatePath);
+              log?.warn(`[wechat-access] jwt_token 已过期，请重新运行 "openclaw channels login --channel wechat-access-unqclawed"`);
+              return;
+            }
+            log?.warn(`[wechat-access] token 刷新失败 (${attempt + 1}/3): ${e instanceof Error ? e.message : String(e)}`);
+          }
+          if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
+        }
+        if (!refreshed) {
+          log?.info(`[wechat-access] token 刷新失败，使用旧 token 尝试连接`);
+        }
       }
 
       const wsConfig = {
